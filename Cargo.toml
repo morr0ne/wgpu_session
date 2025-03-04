@@ -1,0 +1,17 @@
+[package]
+name = "wgpu_session"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.96"
+colpetto = { version = "0.5.1", features = ["helper", "tokio", "tracing"] }
+diretto = "0.0.6"
+input-linux-sys = "0.9.0"
+rustix = { version = "0.38.44", features = ["fs"] }
+saddle = { version = "0.1.0", path = "../saddle" }
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-stream = { version = "0.1.17", default-features = false, features = ["sync"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "tracing-log"] }
+wgpu = { version = "24.0.0", path = "../wgpu/wgpu" }
