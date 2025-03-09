@@ -224,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "colpetto"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc03b5723fbb502f5f7bc5dbc48b04880a22bb0a887bd3da5271fa4811c1e2bc"
+checksum = "a9bac489a5240c777561cb744407f9fd4b42c5218241ad39c28c6396dcf08c9f"
 dependencies = [
  "cc",
  "devil",
@@ -292,12 +292,12 @@ dependencies = [
 
 [[package]]
 name = "diretto"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb0d1e8bb45542b790cbfda9137a81626282b453ff2d0bdcecd1663333913df7"
+checksum = "e7864a07aad9bf60d3e9f8b45a03c0be7f1629e4aa07c4f7a43aa819548dc18f"
 dependencies = [
  "bitflags 2.9.0",
- "rustix 0.38.44",
+ "rustix 1.0.1",
 ]
 
 [[package]]

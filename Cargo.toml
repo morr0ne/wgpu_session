@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.97"
-colpetto = { version = "0.5.1", features = ["helper", "tokio", "tracing"] }
-diretto = "0.0.6"
+colpetto = { version = "0.6.0", features = ["helper", "tokio", "tracing"] }
+diretto = "0.0.7"
 input-linux-sys = "0.9.0"
 rustix = { version = "1.0.1", features = ["fs"] }
 saddle = { version = "0.1.0", path = "../saddle" }
