@@ -1705,7 +1705,7 @@ dependencies = [
  "colpetto",
  "diretto",
  "input-linux-sys",
- "rustix 0.38.44",
+ "rustix 1.0.1",
  "saddle",
  "tokio",
  "tokio-stream",
