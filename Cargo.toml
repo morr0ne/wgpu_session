@@ -15,7 +15,7 @@ tokio-stream = { version = "0.1.17", default-features = false, features = [
     "sync",
 ] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = [
+tracing-subscriber = { version = "0.3.20", features = [
     "env-filter",
     "tracing-log",
 ] }
