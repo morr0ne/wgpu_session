@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use diretto::{
     ClientCapability, Connector, Device as DrmDevice, ModeType, sys::DRM_MODE_OBJECT_PLANE,
 };
@@ -6,19 +6,33 @@ use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{Mode, OFlags, open},
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use wgpu::{Backends, PresentMode, SurfaceTargetUnsafe};
 
-pub struct WgpuContext<'s> {
-    pub surface: wgpu::Surface<'s>,
-    pub _instance: wgpu::Instance,
-    pub _adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub _drm_device: DrmDevice,
+#[derive(Debug)]
+struct DrmState {
+    device: DrmDevice,
+    connector: Connector,
+    mode: diretto::Mode,
+    plane_id: u32,
+    has_master: bool,
 }
 
-fn find_drm_device() -> Result<DrmDevice> {
+#[derive(Debug)]
+struct WgpuState<'s> {
+    surface: wgpu::Surface<'s>,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+pub struct WgpuContext<'s> {
+    drm_state: DrmState,
+    wgpu_state: Option<WgpuState<'s>>,
+}
+
+fn open_drm_device() -> Result<DrmDevice> {
     let fd = open(
         "/dev/dri/card1",
         OFlags::RDWR | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -26,103 +40,139 @@ fn find_drm_device() -> Result<DrmDevice> {
     )?;
     let device = unsafe { DrmDevice::new_unchecked(fd) };
 
-    debug!("Opened device /dev/dri/card1");
-
+    debug!("Opened DRM device /dev/dri/card1");
     Ok(device)
 }
 
-fn find_drm_connector(device: &DrmDevice, resources: &diretto::Resources) -> Result<Connector> {
-    for connector_id in &resources.connectors {
-        let connector = device.get_connector(*connector_id, false)?;
-        if connector.connection.is_connected() {
-            return Ok(connector);
-        }
-    }
-
-    bail!("No connected display found")
+fn setup_drm_master(device: &DrmDevice) -> Result<()> {
+    device.set_master().context("Failed to become DRM master")?;
+    device
+        .set_client_capability(ClientCapability::Atomic, true)
+        .context("Failed to set atomic capability")?;
+    debug!("Acquired DRM master status");
+    Ok(())
 }
 
-impl WgpuContext<'_> {
-    pub async fn new() -> Result<Self> {
-        let drm_device = find_drm_device()?;
-        let resources = drm_device.get_resources()?;
-        let connector = find_drm_connector(&drm_device, &resources)?;
+fn release_drm_master(device: &DrmDevice) -> Result<()> {
+    device.drop_master().context("Failed to drop DRM master")?;
+    debug!("Released DRM master status");
+    Ok(())
+}
 
-        drm_device.set_master()?;
+fn setup_drm_resources(device: &DrmDevice) -> Result<(Connector, diretto::Mode, u32)> {
+    let resources = device.get_resources()?;
 
-        let mode = {
-            let mut mode = None;
-
-            let mut area = 0;
-
-            for current_mode in connector.modes {
-                if current_mode.ty().contains(ModeType::PREFERRED) {
-                    mode = Some(current_mode);
-                    break;
-                }
-
-                let current_area = current_mode.display_width() * current_mode.display_height();
-                if current_area > area {
-                    mode = Some(current_mode);
-                    area = current_area;
-                }
-            }
-
-            mode.expect("Couldn't find a mode")
-        };
-
-        debug!(
-            "Selected mode {}x{}@{}",
-            mode.display_width(),
-            mode.display_height(),
-            mode.vertical_refresh_rate()
-        );
-
-        drm_device.set_client_capability(ClientCapability::Atomic, true)?;
-
-        let plane_resources = drm_device.get_plane_resources()?;
-
-        let mut plane = None;
-
-        for id in plane_resources {
-            debug!("Found plane {id}");
-            let (props, values) = unsafe { drm_device.get_properties(id, DRM_MODE_OBJECT_PLANE)? };
-
-            trace!("Properties for plane {id}:");
-            for (index, prop) in props.into_iter().enumerate() {
-                let (name, possible_values) = unsafe { drm_device.get_property(prop)? };
-                let current_value = values[index];
-
-                trace!(
-                    "  Property '{}' = {} (possible values: {:?})",
-                    name.to_string_lossy(),
-                    current_value,
-                    possible_values
-                );
-
-                if name.as_c_str() == c"type" {
-                    match current_value {
-                        1 => {
-                            trace!("    This is a primary plane");
-                            plane = Some(id)
-                        }
-                        2 => trace!("    This is an overlay plane"),
-                        3 => trace!("    This is a cursor plane"),
-                        _ => trace!("    Unknown plane type"),
-                    }
-                }
+    // Find connected connector
+    let connector = {
+        let mut found_connector = None;
+        for connector_id in &resources.connectors {
+            let connector = device.get_connector(*connector_id, false)?;
+            if connector.connection.is_connected() {
+                found_connector = Some(connector);
+                break;
             }
         }
+        found_connector.ok_or_else(|| anyhow::anyhow!("No connected display found"))?
+    };
 
-        let plane = plane.expect("Failed to find an appropriate plane");
+    // Find best mode
+    let mode = {
+        let mut best_mode = None;
+        let mut max_area = 0;
 
+        for current_mode in connector.modes.iter().copied() {
+            if current_mode.ty().contains(ModeType::DEFAULT) {
+                best_mode = Some(current_mode);
+                break;
+            }
+
+            let area = current_mode.display_width() as u32 * current_mode.display_height() as u32;
+            if area > max_area {
+                best_mode = Some(current_mode);
+                max_area = area;
+            }
+        }
+        best_mode.ok_or_else(|| anyhow::anyhow!("No suitable mode found"))?
+    };
+
+    debug!(
+        "Selected mode {}x{}@{}",
+        mode.display_width(),
+        mode.display_height(),
+        mode.vertical_refresh_rate()
+    );
+
+    // Find primary plane
+    let plane_id = {
+        let plane_resources = device.get_plane_resources()?;
+        let mut primary_plane = None;
+
+        for id in plane_resources {
+            let (props, values) = unsafe { device.get_properties(id, DRM_MODE_OBJECT_PLANE)? };
+
+            for (index, prop) in props.into_iter().enumerate() {
+                let (name, _) = unsafe { device.get_property(prop)? };
+                let current_value = values[index];
+
+                if name.as_c_str() == c"type" && current_value == 1 {
+                    trace!("Found primary plane: {}", id);
+                    primary_plane = Some(id);
+                    break;
+                }
+            }
+
+            if primary_plane.is_some() {
+                break;
+            }
+        }
+        primary_plane.ok_or_else(|| anyhow::anyhow!("No primary plane found"))?
+    };
+
+    Ok((connector, mode, plane_id))
+}
+
+impl Drop for DrmState {
+    fn drop(&mut self) {
+        if self.has_master {
+            if let Err(e) = release_drm_master(&self.device) {
+                warn!("Failed to release DRM master on drop: {}", e);
+            }
+        }
+    }
+}
+
+impl<'s> WgpuContext<'s> {
+    pub async fn new() -> Result<Self> {
+        let device = open_drm_device()?;
+        setup_drm_master(&device)?;
+
+        let (connector, mode, plane_id) = setup_drm_resources(&device)?;
+
+        let drm_state = DrmState {
+            device,
+            connector,
+            mode,
+            plane_id,
+            has_master: true,
+        };
+
+        let mut context = Self {
+            drm_state,
+            wgpu_state: None,
+        };
+
+        context.create_wgpu_resources().await?;
+        Ok(context)
+    }
+
+    async fn create_wgpu_resources(&mut self) -> Result<()> {
         let surface_target = SurfaceTargetUnsafe::Drm {
-            fd: drm_device.as_fd().as_raw_fd(),
-            plane,
-            connector_id: connector.connector_id.into(),
-            width: mode.display_width() as u32,
-            height: mode.display_height() as u32,
-            refresh_rate: mode.vertical_refresh_rate() * 1000,
+            fd: self.drm_state.device.as_fd().as_raw_fd(),
+            plane: self.drm_state.plane_id,
+            connector_id: self.drm_state.connector.connector_id.into(),
+            width: self.drm_state.mode.display_width() as u32,
+            height: self.drm_state.mode.display_height() as u32,
+            refresh_rate: self.drm_state.mode.vertical_refresh_rate() * 1000,
         };
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -142,58 +192,100 @@ impl WgpuContext<'_> {
 
         let surface = unsafe { instance.create_surface_unsafe(surface_target)? };
 
-        // Create the logical device and command queue
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: wgpu::Features::empty(),
-                    // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                    required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            })
             .await
             .context("Failed to create device")?;
 
         let mut config = surface
             .get_default_config(
                 &adapter,
-                mode.display_width().into(),
-                mode.display_height().into(),
+                self.drm_state.mode.display_width().into(),
+                self.drm_state.mode.display_height().into(),
             )
-            .expect("Surface not supported by adapter");
+            .context("Surface not supported by adapter")?;
 
         config.present_mode = PresentMode::AutoVsync;
-
         surface.configure(&device, &config);
 
-        Ok(Self {
+        self.wgpu_state = Some(WgpuState {
             surface,
-            _instance: instance,
-            _adapter: adapter,
+            instance,
+            adapter,
             device,
             queue,
-            _drm_device: drm_device,
-        })
+        });
+
+        debug!("Created WGPU resources");
+        Ok(())
+    }
+
+    fn destroy_wgpu_resources(&mut self) {
+        if self.wgpu_state.take().is_some() {
+            debug!("Destroyed WGPU resources");
+        }
+    }
+
+    pub fn suspend(&mut self) -> Result<()> {
+        debug!("Suspending context");
+        self.destroy_wgpu_resources();
+
+        if self.drm_state.has_master {
+            release_drm_master(&self.drm_state.device)?;
+            self.drm_state.has_master = false;
+        }
+
+        Ok(())
+    }
+
+    pub async fn resume(&mut self) -> Result<()> {
+        debug!("Resuming context");
+
+        if !self.drm_state.has_master {
+            setup_drm_master(&self.drm_state.device)?;
+            self.drm_state.has_master = true;
+        }
+
+        if self.wgpu_state.is_none() {
+            self.create_wgpu_resources().await?;
+        }
+
+        Ok(())
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.drm_state.has_master && self.wgpu_state.is_some()
     }
 
     pub fn present(&self) -> Result<()> {
-        let frame = self
+        let wgpu_state = self
+            .wgpu_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cannot present: WGPU resources not available"))?;
+
+        if !self.drm_state.has_master {
+            return Err(anyhow::anyhow!("Cannot present: no DRM master status"));
+        }
+
+        let frame = wgpu_state
             .surface
             .get_current_texture()
-            .expect("failed to acquire next swapchain texture");
+            .context("Failed to acquire next swapchain texture")?;
 
         let texture_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
+        let mut encoder = wgpu_state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        // Create the renderpass which will clear the screen.
         let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: None,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -203,20 +295,15 @@ impl WgpuContext<'_> {
                     load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
         });
 
-        // If you wanted to call any drawing commands, they would go here.
-
-        // End the renderpass.
         drop(renderpass);
-
-        // Submit the command in the queue to execute
-        self.queue.submit([encoder.finish()]);
-
+        wgpu_state.queue.submit([encoder.finish()]);
         frame.present();
 
         Ok(())

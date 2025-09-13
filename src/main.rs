@@ -23,10 +23,11 @@ use input_linux_sys::{
 use saddle::Seat;
 use tokio::{
     pin,
-    sync::{RwLock, mpsc, watch},
+    sync::{RwLock, watch},
     time::sleep,
 };
 use tokio_stream::{StreamExt, wrappers::WatchStream};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 mod context;
@@ -174,10 +175,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (exit_sx, mut exit_rx) = mpsc::unbounded_channel();
+    let exit_token = CancellationToken::new();
 
     tokio::spawn({
         let seat = seat.clone();
+        let exit_token = exit_token.clone();
 
         async move {
             let mut has_control = false;
@@ -185,24 +187,27 @@ async fn main() -> Result<()> {
 
             loop {
                 tokio::select! {
+                    biased;
                     Some(control) = control_stream.next() =>  has_control = control,
                     Some(event) = event_stream.next() => {
                         match event {
                             Ok(event) => match event.event_type {
                                 EventType::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
-                                    modifier_state.write().await.update(key, state);
+                                    let (should_check_vt_switch, is_ctrl_alt_pressed) = {
+                                        let mut ms = modifier_state.write().await;
+                                        ms.update(key, state);
+                                        (state == KeyState::Pressed, ms.is_ctrl_alt_pressed())
+                                    };
 
-                                    if state == KeyState::Pressed {
+                                    if should_check_vt_switch {
                                         // Handle ESC for exit
                                         if key as i32 == KEY_ESC {
                                             libinput_handle.shutdown();
-                                            if exit_sx.send(()).is_err() {
-                                                break
-                                            }
+                                            exit_token.cancel();
                                         }
 
                                         // Only process function keys when Ctrl+Alt are held
-                                        if modifier_state.read().await.is_ctrl_alt_pressed() {
+                                        if is_ctrl_alt_pressed {
                                             if let Some(vt) = key_map.get_vt(key) {
                                                 if has_control {
                                                     info!("Ctrl+Alt+F{vt} pressed, switching to VT {vt}");
@@ -229,33 +234,58 @@ async fn main() -> Result<()> {
 
     let mut has_control = false;
     let mut control_stream = WatchStream::new(control_rx);
-    let mut render_context = None;
+    let mut render_context: Option<WgpuContext> = None;
 
     loop {
         tokio::select! {
             biased;
-            _ = exit_rx.recv() => {
+            _ = exit_token.cancelled() => {
                 info!("Exiting...");
                 break
             }
             Some(control) = control_stream.next() => {
-                has_control = control;
+                if control != has_control {
+                    has_control = control;
+
+                    if has_control {
+                        match render_context.as_mut() {
+                            Some(ctx) => {
+                                info!("Resuming rendering context");
+                                if let Err(e) = ctx.resume().await {
+                                    error!("Failed to resume context: {}", e);
+                                    render_context = None;
+                                }
+                            }
+                            None => {
+                                info!("Creating rendering context");
+                                match WgpuContext::new().await {
+                                    Ok(ctx) => render_context = Some(ctx),
+                                    Err(e) => error!("Failed to create context: {}", e),
+                                }
+                            }
+                        }
+                    } else {
+                        if let Some(ref mut ctx) = render_context {
+                            info!("Suspending rendering context");
+                            if let Err(e) = ctx.suspend() {
+                                error!("Failed to suspend context: {}", e);
+                            }
+                        }
+                    }
+                }
             }
             else => {}  // No control changes
         };
 
-        if has_control {
-            if render_context.is_none() {
-                info!("Creating rendering context");
-                render_context = Some(WgpuContext::new().await?);
-            }
-        } else if render_context.is_some() {
-            info!("Dropping rendering context");
-            render_context = None;
-        }
-
+        // Only present if we have an active context
         if let Some(ref context) = render_context {
-            context.present()?;
+            if context.is_active() {
+                if let Err(e) = context.present() {
+                    error!("Present failed: {}", e);
+                    // Drop the context on present failure - it will be recreated on next control gain
+                    render_context = None;
+                }
+            }
         }
     }
 
