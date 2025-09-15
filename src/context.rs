@@ -6,7 +6,7 @@ use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{Mode, OFlags, open},
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 use wgpu::{Backends, PresentMode, SurfaceTargetUnsafe};
 
 #[derive(Debug)]
@@ -27,8 +27,8 @@ struct WgpuState<'s> {
 }
 
 pub struct WgpuContext<'s> {
-    drm_state: DrmState,
     wgpu_state: WgpuState<'s>,
+    _drm_state: DrmState,
 }
 
 fn open_drm_device() -> Result<DrmDevice> {
@@ -43,21 +43,13 @@ fn open_drm_device() -> Result<DrmDevice> {
     Ok(device)
 }
 
-impl Drop for DrmState {
-    fn drop(&mut self) {
-        if let Err(e) = self.device.drop_master() {
-            warn!("Failed to release DRM master on drop: {}", e);
-        }
-    }
-}
-
 impl<'s> WgpuContext<'s> {
     pub async fn new() -> Result<Self> {
         let drm_state = Self::create_drm_resources()?;
         let wgpu_state = Self::create_wgpu_resources(&drm_state).await?;
 
         Ok(Self {
-            drm_state,
+            _drm_state: drm_state,
             wgpu_state,
         })
     }

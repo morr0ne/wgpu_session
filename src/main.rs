@@ -2,9 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
     os::fd::{BorrowedFd, IntoRawFd},
-    process::exit,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::Result;
@@ -24,10 +22,8 @@ use saddle::Seat;
 use tokio::{
     pin,
     sync::{RwLock, watch},
-    time::sleep,
 };
 use tokio_stream::{StreamExt, wrappers::WatchStream};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 mod context;
@@ -101,11 +97,6 @@ impl ModifierState {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    tokio::spawn(async {
-        sleep(Duration::from_secs(5)).await;
-        exit(-1)
-    });
-
     let seat = Seat::new().await?;
     let seat_name = CString::new(seat.seat_name()).expect("Invalid seat name");
 
@@ -142,7 +133,6 @@ async fn main() -> Result<()> {
     let modifier_state = Arc::new(RwLock::new(ModifierState::new()));
 
     let (control_sx, control_rx) = watch::channel::<bool>(false);
-    let libinput_control_rx = control_sx.subscribe();
 
     tokio::spawn({
         let seat = seat.clone();
@@ -175,63 +165,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    let exit_token = CancellationToken::new();
-
-    tokio::spawn({
-        let seat = seat.clone();
-        let exit_token = exit_token.clone();
-
-        async move {
-            let mut has_control = false;
-            let mut control_stream = WatchStream::new(libinput_control_rx);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(control) = control_stream.next() =>  has_control = control,
-                    Some(event) = event_stream.next() => {
-                        match event {
-                            Ok(event) => match event.event_type {
-                                EventType::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
-                                    let (should_check_vt_switch, is_ctrl_alt_pressed) = {
-                                        let mut ms = modifier_state.write().await;
-                                        ms.update(key, state);
-                                        (state == KeyState::Pressed, ms.is_ctrl_alt_pressed())
-                                    };
-
-                                    if should_check_vt_switch {
-                                        // Handle ESC for exit
-                                        if key as i32 == KEY_ESC {
-                                            libinput_handle.shutdown();
-                                            exit_token.cancel();
-                                        }
-
-                                        // Only process function keys when Ctrl+Alt are held
-                                        if is_ctrl_alt_pressed {
-                                            if let Some(vt) = key_map.get_vt(key) {
-                                                if has_control {
-                                                    info!("Ctrl+Alt+F{vt} pressed, switching to VT {vt}");
-
-                                                    if let Err(e) = seat.switch_session(vt).await {
-                                                        error!("Failed to switch to VT {vt}: {e}");
-                                                    }
-                                                } else {
-                                                    debug!("Not switching VT - session inactive");
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            },
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        }
-    });
-
     let mut has_control = false;
     let mut control_stream = WatchStream::new(control_rx);
     let mut render_context: Option<WgpuContext> = None;
@@ -239,31 +172,64 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             biased;
-            _ = exit_token.cancelled() => {
-                info!("Exiting...");
-                break
-            }
             Some(control) = control_stream.next() => {
                 if control != has_control {
                     has_control = control;
 
                     if has_control {
-                        // Always create fresh context when gaining session control
                         info!("Session activated - creating fresh rendering context");
                         match WgpuContext::new().await {
                             Ok(ctx) => render_context = Some(ctx),
                             Err(e) => error!("Failed to create context: {}", e),
                         }
-                    } else {
-                        info!("Session deactivated - destroying rendering context completely");
-                        render_context = None;
                     }
                 }
             }
-            else => {}  // No control changes
+            Some(event) = event_stream.next() => {
+                match event {
+                    Ok(event) => match event.event_type {
+                        EventType::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
+                            let (should_check_vt_switch, is_ctrl_alt_pressed) = {
+                                let mut ms = modifier_state.write().await;
+                                ms.update(key, state);
+                                (state == KeyState::Pressed, ms.is_ctrl_alt_pressed())
+                            };
+
+                            if should_check_vt_switch {
+                                // Handle ESC for exit
+                                if key as i32 == KEY_ESC {
+                                    libinput_handle.shutdown();
+                                    break;
+                                }
+
+                                // Only process function keys when Ctrl+Alt are held
+                                if is_ctrl_alt_pressed && let Some(vt) = key_map.get_vt(key) {
+                                    if has_control {
+                                        info!("Ctrl+Alt+F{vt} pressed, attempting a VT switch to {vt}");
+
+                                        if let Ok(current_vt) = seat.current_session().await && vt != current_vt {
+                                            info!("Deactivating session - destroying rendering context completely");
+
+                                            render_context = None;
+
+                                            if let Err(e) = seat.switch_session(vt).await {
+                                                error!("Failed to switch to VT {vt}: {e}");
+                                            }
+                                        }
+                                    } else {
+                                        debug!("Not switching VT - session inactive");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Err(_) => break,
+                }
+            }
+            else => {}
         };
 
-        // Only present if we have an active context
         if let Some(ref context) = render_context {
             if let Err(e) = context.present() {
                 error!("Present failed: {}", e);
