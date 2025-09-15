@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     tokio::spawn(async {
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(5)).await;
         exit(-1)
     });
 
@@ -248,29 +248,15 @@ async fn main() -> Result<()> {
                     has_control = control;
 
                     if has_control {
-                        match render_context.as_mut() {
-                            Some(ctx) => {
-                                info!("Resuming rendering context");
-                                if let Err(e) = ctx.resume().await {
-                                    error!("Failed to resume context: {}", e);
-                                    render_context = None;
-                                }
-                            }
-                            None => {
-                                info!("Creating rendering context");
-                                match WgpuContext::new().await {
-                                    Ok(ctx) => render_context = Some(ctx),
-                                    Err(e) => error!("Failed to create context: {}", e),
-                                }
-                            }
+                        // Always create fresh context when gaining session control
+                        info!("Session activated - creating fresh rendering context");
+                        match WgpuContext::new().await {
+                            Ok(ctx) => render_context = Some(ctx),
+                            Err(e) => error!("Failed to create context: {}", e),
                         }
                     } else {
-                        if let Some(ref mut ctx) = render_context {
-                            info!("Suspending rendering context");
-                            if let Err(e) = ctx.suspend() {
-                                error!("Failed to suspend context: {}", e);
-                            }
-                        }
+                        info!("Session deactivated - destroying rendering context completely");
+                        render_context = None;
                     }
                 }
             }
@@ -279,12 +265,8 @@ async fn main() -> Result<()> {
 
         // Only present if we have an active context
         if let Some(ref context) = render_context {
-            if context.is_active() {
-                if let Err(e) = context.present() {
-                    error!("Present failed: {}", e);
-                    // Drop the context on present failure - it will be recreated on next control gain
-                    render_context = None;
-                }
+            if let Err(e) = context.present() {
+                error!("Present failed: {}", e);
             }
         }
     }
