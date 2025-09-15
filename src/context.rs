@@ -15,7 +15,6 @@ struct DrmState {
     connector: Connector,
     mode: diretto::Mode,
     plane_id: u32,
-    has_master: bool,
 }
 
 #[derive(Debug)]
@@ -46,26 +45,15 @@ fn open_drm_device() -> Result<DrmDevice> {
 
 impl Drop for DrmState {
     fn drop(&mut self) {
-        if self.has_master {
-            if let Err(e) = self.device.drop_master() {
-                warn!("Failed to release DRM master on drop: {}", e);
-            }
+        if let Err(e) = self.device.drop_master() {
+            warn!("Failed to release DRM master on drop: {}", e);
         }
     }
 }
 
 impl<'s> WgpuContext<'s> {
     pub async fn new() -> Result<Self> {
-        let (device, connector, mode, plane_id) = Self::create_drm_resources()?;
-
-        let drm_state = DrmState {
-            device,
-            connector,
-            mode,
-            plane_id,
-            has_master: true,
-        };
-
+        let drm_state = Self::create_drm_resources()?;
         let wgpu_state = Self::create_wgpu_resources(&drm_state).await?;
 
         Ok(Self {
@@ -74,7 +62,7 @@ impl<'s> WgpuContext<'s> {
         })
     }
 
-    fn create_drm_resources() -> Result<(DrmDevice, Connector, diretto::Mode, u32)> {
+    fn create_drm_resources() -> Result<DrmState> {
         let device = open_drm_device()?;
         device.set_client_capability(ClientCapability::Atomic, true)?;
         device.set_master().context("Failed to become DRM master")?;
@@ -148,7 +136,12 @@ impl<'s> WgpuContext<'s> {
             primary_plane.ok_or_else(|| anyhow::anyhow!("No primary plane found"))?
         };
 
-        Ok((device, connector, mode, plane_id))
+        Ok(DrmState {
+            device,
+            connector,
+            mode,
+            plane_id,
+        })
     }
 
     async fn create_wgpu_resources<'a, 'b>(drm_state: &'b DrmState) -> Result<WgpuState<'a>> {
@@ -212,10 +205,6 @@ impl<'s> WgpuContext<'s> {
 
     pub fn present(&self) -> Result<()> {
         let wgpu_state = &self.wgpu_state;
-
-        if !self.drm_state.has_master {
-            return Err(anyhow::anyhow!("Cannot present: no DRM master status"));
-        }
 
         let frame = wgpu_state
             .surface
